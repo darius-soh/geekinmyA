@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Sure Bo?
 
 An opinionated news credibility checker built for fast demos and clear signal design.
@@ -250,3 +251,6 @@ This codebase is intentionally optimized for an MVP:
 ## License
 
 Internal project / hackathon MVP unless your team adds a separate license file.
+=======
+# geekinmyA
+>>>>>>> b48807946586be1d53da5ba4058f67d768958c6f
