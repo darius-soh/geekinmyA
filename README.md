@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Sure Bo?
 
 An opinionated news credibility checker built for fast demos and clear signal design.
