@@ -2,12 +2,21 @@
 // Generates article summaries, signals, and context-aware recommendations.
 import { mockAnalysis } from '../data/mockAnalysis';
 import { mockArticles } from '../data/mockArticles';
+import { findClaimCheckFixture } from '../data/claimCheckFixtures';
 import { getTranslation } from '../i18n';
 import {
   localizeCredibilityList,
   localizeCredibilityText,
 } from '../utils/localizedCredibilityCopy';
 import { getAllArticles, getArticleById, getArticlesByCategory, searchArticles } from './articlesApi';
+import {
+  buildClaimCheckResult,
+  CLAIM_INPUT_TYPES,
+  detectClaimInputType,
+  extractFirstUrl,
+  legacyCredibilityFromVerdict,
+  normalizeQuestionToClaimHeuristic,
+} from '../../shared/claimCheckModel.js';
 
 const STOPWORDS = new Set([
   'the', 'and', 'for', 'with', 'this', 'that', 'from', 'are', 'was', 'were',
@@ -519,34 +528,45 @@ export async function analyzeArticle(articleOrId, { language = 'en' } = {}) {
 }
 
 export async function analyzeUserClaim(input) {
-  await simulateDelay(900);
+  await simulateDelay(350);
 
-  const { text, url, fileName, language = 'en' } = input;
-  const query = text || url || fileName || '';
+  const { text, url, fileName } = input;
+  const typedText = safeText(text);
+  const detectedUrl = safeText(url) || extractFirstUrl(typedText);
+  const inputType = detectClaimInputType({
+    text: typedText,
+    url: detectedUrl,
+    fileName,
+    fromScreenshot: Boolean(fileName),
+  });
+  const originalInput = inputType === CLAIM_INPUT_TYPES.URL_ARTICLE
+    ? detectedUrl
+    : typedText || fileName || '';
+  const detectedLanguage = detectLanguage(typedText || originalInput);
+  const fixture = findClaimCheckFixture({
+    text: typedText,
+    url: detectedUrl,
+  });
 
-  const matchedArticle = mockArticles.find(a =>
-    query.toLowerCase().includes(a.title.toLowerCase().slice(0, 30))
-    || a.title.toLowerCase().includes(query.toLowerCase().slice(0, 30))
-  );
-
-  if (matchedArticle && mockAnalysis[matchedArticle.id]) {
-    const analysis = localizeAnalysisOutput(mockAnalysis[matchedArticle.id], language);
-    return {
-      ...analysis,
-      matchedArticle,
-      detectedLanguage: detectLanguage(query),
-      originalClaim: query,
-    };
+  if (fixture) {
+    return buildLocalSearchEnvelope({
+      baseResult: buildClaimCheckResult({
+        ...fixture.result,
+        originalInput,
+      }),
+      detectedLanguage,
+      originalInput,
+      sourceUrl: detectedUrl,
+    });
   }
 
-  const detectedLang = detectLanguage(query);
-  const analysis = localizeAnalysisOutput(generateClaimAnalysis(query), language);
-
-  return {
-    ...analysis,
-    detectedLanguage: detectedLang,
-    originalClaim: query,
-  };
+  return buildLocalFallbackClaimResult({
+    inputType,
+    originalInput,
+    detectedLanguage,
+    sourceUrl: detectedUrl,
+    hasUserText: Boolean(typedText),
+  });
 }
 
 function detectLanguage(text) {
@@ -563,65 +583,155 @@ function detectLanguage(text) {
   return 'en';
 }
 
-function generateClaimAnalysis(claim) {
-  const isUrl = claim.startsWith('http') || claim.includes('.com') || claim.includes('.sg');
-  const isLong = claim.length > 100;
-  const containsSensationalWords = /breaking|urgent|shocking|secret|must see|share now|forwarded/i.test(claim);
-  const containsOfficialRef = /gov\.sg|moh|mas|cpf|hdb|lta|nea|pub|pofma/i.test(claim);
+function ensureSentence(value) {
+  const text = normalizeWhitespace(value).replace(/[.?!]+$/, '');
+  return text ? `${text}.` : '';
+}
 
-  let credibility = 'undetermined';
-  let confidence = 45;
-  let explanation = '';
+function deriveSourceCredibilityScoreFromUrl(url) {
+  const normalized = normalizeUrl(url);
+  if (!normalized) return null;
 
-  if (containsSensationalWords) {
-    credibility = 'mixed';
-    confidence = 55;
-    explanation = 'This claim uses sensational language often associated with misleading content. Verify it with official sources before sharing.';
-  } else if (containsOfficialRef) {
-    credibility = 'mixed';
-    confidence = 60;
-    explanation = 'This claim references official institutions but the specific details are not fully verified yet.';
-  } else if (isUrl) {
-    credibility = 'undetermined';
-    confidence = 40;
-    explanation = 'The provided URL could not be fully verified. Cross-check this claim with trusted outlets before sharing.';
-  } else {
-    credibility = 'undetermined';
-    confidence = 35;
-    explanation = 'There is insufficient evidence to verify this claim at the moment.';
+  if (/(gov\.sg|gov|who\.int|nasa\.gov|reuters\.com|apnews\.com|bbc\.com|straitstimes\.com)/i.test(normalized)) {
+    return 88;
+  }
+  if (/(facebook\.com|instagram\.com|tiktok\.com|reddit\.com|rumour-mill\.example)/i.test(normalized)) {
+    return 24;
+  }
+  return 55;
+}
+
+function buildSourceCredibilityExplanation(score) {
+  if (score === null || score === undefined) return '';
+  if (score >= 75) return 'This source appears reputable, but individual claims should still be checked.';
+  if (score <= 39) return 'This source appears weak, but some claims may still be accurate.';
+  return 'This source has mixed reputation signals, so claim-level evidence matters more than the domain alone.';
+}
+
+function buildRecommendedNextStep(verdict, inputType) {
+  if (verdict === 'supported' || verdict === 'likely_supported') {
+    return inputType === CLAIM_INPUT_TYPES.URL_ARTICLE
+      ? 'This source may be usable, but verify important claims with primary sources.'
+      : 'Evidence suggests this claim is supported, but use primary sources for high-stakes decisions.';
   }
 
+  if (verdict === 'unsupported' || verdict === 'likely_unsupported') {
+    return 'Available evidence does not support this claim. Verify against official or primary sources before sharing.';
+  }
+
+  return 'Evidence is mixed or unavailable in the local fallback. Check official or primary sources before relying on this.';
+}
+
+function extractDomainLabel(url) {
+  const raw = safeText(url);
+  if (!raw) return '';
+
+  try {
+    const parsed = new URL(raw.startsWith('http') ? raw : `https://${raw}`);
+    return parsed.hostname.replace(/^www\./, '');
+  } catch {
+    return raw.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '');
+  }
+}
+
+function buildLocalSearchEnvelope({
+  baseResult,
+  detectedLanguage,
+  originalInput,
+  sourceUrl = '',
+}) {
+  const legacyCredibility = legacyCredibilityFromVerdict(baseResult.verdict);
+  const sourceDomain = extractDomainLabel(sourceUrl);
+
   return {
-    credibility,
-    confidence,
-    explanation,
-    summary: [
-      `Claim reviewed: "${claim.slice(0, 80)}${claim.length > 80 ? '...' : ''}"`,
-      'Assessment is based on available linguistic and context signals.',
-      credibility === 'undetermined'
-        ? 'Current evidence is insufficient for a definitive conclusion.'
-        : `Current signals support a ${credibility} assessment.`,
-    ],
-    signals: {
-      sourceReputation: containsOfficialRef ? 'medium' : 'low',
-      consistency: 'low',
-      crossSource: false,
-      evidencePresent: isLong,
-      headlineTone: containsSensationalWords ? 'sensational' : 'neutral',
-      recency: 'recent',
-      officialSources: containsOfficialRef,
-    },
-    recommendation: {
-      action: credibility === 'undetermined'
-        ? 'Do not share this yet. Verify with official agencies and trusted media first.'
-        : 'Proceed with caution and confirm the claim with official references.',
-      resources: [
-        { name: 'Gov.sg Factually', url: 'https://www.gov.sg/factually' },
-        { name: 'ScamShield', url: 'https://www.scamshield.org.sg/' },
-      ],
-      relatedArticleIds: [],
-    },
+    ...baseResult,
+    detectedLanguage,
+    originalInput,
+    originalClaim: originalInput,
+    headline: baseResult.inputType === CLAIM_INPUT_TYPES.URL_ARTICLE
+      ? sourceUrl || originalInput
+      : baseResult.normalizedClaim || originalInput,
+    articleSummary: '',
+    checkedClaims: baseResult.normalizedClaim
+      ? [{ claim: baseResult.normalizedClaim, score: baseResult.claimSupportScore }]
+      : [],
+    sourceDetails: sourceUrl
+      ? {
+          domain: sourceDomain,
+          sourceName: sourceDomain,
+        }
+      : null,
+    sourceCredibilityExplanation: buildSourceCredibilityExplanation(baseResult.sourceCredibilityScore),
+    recommendedNextStep: buildRecommendedNextStep(baseResult.verdict, baseResult.inputType),
+    credibility: legacyCredibility,
+    appCredibility: legacyCredibility,
+    score: baseResult.claimSupportScore,
+    confidenceScore: baseResult.confidence,
+    credibleSourceSimilarity: null,
   };
+}
+
+function buildLocalFallbackClaimResult({
+  inputType,
+  originalInput,
+  detectedLanguage,
+  sourceUrl,
+  hasUserText = true,
+}) {
+  const questionNormalization = inputType === CLAIM_INPUT_TYPES.OPEN_ENDED_QUESTION
+    ? normalizeQuestionToClaimHeuristic(originalInput)
+    : null;
+  const screenshotWithoutText = inputType === CLAIM_INPUT_TYPES.SCREENSHOT_OR_EXTRACTED_TEXT
+    && !hasUserText;
+  const normalizedClaim = inputType === CLAIM_INPUT_TYPES.OPEN_ENDED_QUESTION
+    ? questionNormalization?.normalizedClaim
+    : inputType === CLAIM_INPUT_TYPES.URL_ARTICLE
+      ? null
+      : screenshotWithoutText
+        ? null
+        : ensureSentence(originalInput);
+
+  const limitations = [];
+  if (inputType === CLAIM_INPUT_TYPES.SCREENSHOT_OR_EXTRACTED_TEXT) {
+    limitations.push('This request came from the screenshot / extracted-text flow.');
+    if (screenshotWithoutText) {
+      limitations.push('No extracted text was available locally, so the screenshot could not be verified in this fallback mode.');
+    }
+  }
+  if (inputType === CLAIM_INPUT_TYPES.URL_ARTICLE) {
+    limitations.push('Local fallback can score the source URL, but it cannot fetch external evidence for the article claims.');
+  } else {
+    limitations.push('Trusted-source retrieval is unavailable in the local fallback, so this result is intentionally inconclusive unless a built-in fixture matched.');
+  }
+  if (questionNormalization?.needsAnswerFromEvidence) {
+    limitations.push('This question needs evidence retrieval to fill in the underlying claim precisely.');
+  }
+
+  const sourceCredibilityScore = inputType === CLAIM_INPUT_TYPES.URL_ARTICLE
+    ? deriveSourceCredibilityScoreFromUrl(sourceUrl)
+    : null;
+
+  const baseResult = buildClaimCheckResult({
+    inputType,
+    originalInput,
+    normalizedClaim,
+    sourceCredibilityScore,
+    claimSupportScore: 50,
+    verdict: 'mixed',
+    confidence: inputType === CLAIM_INPUT_TYPES.URL_ARTICLE ? 52 : 42,
+    explanation: inputType === CLAIM_INPUT_TYPES.URL_ARTICLE
+      ? 'Local fallback could assess the source domain, but it could not verify the article’s main claims against external evidence.'
+      : 'Local fallback could not retrieve enough trusted evidence to verify this claim, so the result remains inconclusive.',
+    evidence: [],
+    limitations,
+  });
+
+  return buildLocalSearchEnvelope({
+    baseResult,
+    detectedLanguage,
+    originalInput,
+    sourceUrl,
+  });
 }
 
 export async function getRelatedArticles(articleOrId) {

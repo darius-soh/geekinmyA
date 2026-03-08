@@ -7,6 +7,7 @@ import { analyzeWithOpenAI } from '../api/openaiService';
 import { analyzeUserClaim } from '../api/credibilityEngine';
 import UploadDropzone from '../components/UploadDropzone';
 import { Button } from '../components/ui/moving-border';
+import { detectClaimInputType } from '../../shared/claimCheckModel.js';
 
 // Detect if text looks like a URL
 function isUrl(text) {
@@ -32,16 +33,37 @@ export default function SearchPage() {
     setError('');
     const userInput = query.trim();
     const url = isUrl(userInput) ? (userInput.startsWith('http') ? userInput : `https://${userInput}`) : undefined;
+    const inputType = detectClaimInputType({
+      text: userInput,
+      url,
+      fileName: file?.name,
+      fromScreenshot: Boolean(file),
+    });
 
     try {
       // Try OpenAI first
-      setLoadingStage(t('search.connectingToAI'));
+      setLoadingStage(t('search.classifyingInput'));
       
       try {
-        if (url) setLoadingStage(t('search.fetchingArticleContent'));
-        await new Promise(r => setTimeout(r, 300)); // Brief visual feedback
+        await new Promise(r => setTimeout(r, 150));
 
-        setLoadingStage(t('search.checking'));
+        if (inputType === 'url_article') {
+          setLoadingStage(t('search.fetchingArticleContent'));
+        } else if (inputType === 'open_ended_question') {
+          setLoadingStage(t('search.normalizingQuestion'));
+        } else if (inputType === 'screenshot_or_extracted_text') {
+          setLoadingStage(t('search.processingScreenshot'));
+        } else {
+          setLoadingStage(t('search.retrievingEvidence'));
+        }
+
+        await new Promise(r => setTimeout(r, 150));
+
+        setLoadingStage(
+          inputType === 'url_article'
+            ? t('search.checkingSourceAndClaims')
+            : t('search.retrievingEvidence')
+        );
         const result = await analyzeWithOpenAI({
           text: userInput,
           url,
@@ -56,7 +78,7 @@ export default function SearchPage() {
         console.warn('OpenAI analysis failed, falling back to local engine:', aiErr.message);
         
         // Fall back to local mock engine
-        setLoadingStage(t('search.localAnalysis'));
+        setLoadingStage(t('search.localFallback'));
         const result = await analyzeUserClaim({
           text: userInput,
           url,

@@ -1,19 +1,41 @@
 import { createHash } from 'node:crypto';
 import { evaluateCredibleSourceSimilarity } from './pineconeCredibility.js';
-import { loadCredibleSources } from './credibleSources.js';
+import {
+  extractDomainFromUrl,
+  getCredibleSourceByDomain,
+  loadCredibleSources,
+  normalizeDomain,
+} from './credibleSources.js';
 import {
   clampScore,
   deriveCredibilityAssessment,
   verdictToAppCredibility,
 } from '../shared/credibilityModel.js';
 import { buildInitialArticleCredibility } from '../shared/sourceRegistryAssessment.js';
+import {
+  buildClaimCheckResult,
+  CLAIM_INPUT_TYPES,
+  CLAIM_VERDICTS,
+  detectClaimInputType,
+  deriveConfidence,
+  extractFirstUrl,
+  legacyCredibilityFromVerdict,
+  normalizeQuestionToClaimHeuristic,
+  normalizeWhitespace as normalizeClaimWhitespace,
+  verdictFromClaimSupportScore,
+} from '../shared/claimCheckModel.js';
 
 const ARTICLE_EXTRACTION_CACHE_TTL_MS = 30 * 60 * 1000;
 const CREDIBILITY_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
-const CREDIBILITY_OUTPUT_VERSION = 'v2';
+const CREDIBILITY_OUTPUT_VERSION = 'v3';
 const OPENAI_MODEL = 'gpt-4o-mini';
 const MAX_BODY_CHARACTERS = 12_000;
 const MAX_SUMMARY_CHARACTERS = 360;
+const MAX_EVIDENCE_RESULTS = 6;
+const MAX_CLAIMS_TO_CHECK = 3;
+const SEARCH_TIMEOUT_MS = 10_000;
+const SEARCH_RESULT_WINDOW = 1_800;
+const SEARCH_USER_AGENT = 'Mozilla/5.0 (compatible; SureBoClaimRetriever/1.0)';
 
 const extractionCache = new Map();
 const articleCredibilityCache = new Map();
@@ -32,6 +54,40 @@ const TRACKING_QUERY_PARAMS = new Set([
   's',
   'share',
   'spm',
+]);
+
+const DUCKDUCKGO_SEARCH_ENDPOINTS = [
+  'https://html.duckduckgo.com/html/',
+  'https://duckduckgo.com/html/',
+];
+
+const PRIMARY_SOURCE_TYPES = new Set([
+  'government',
+  'public-health-agency',
+  'regulator',
+  'statistics-agency',
+  'public-institution',
+  'central-bank',
+  'international-organization',
+  'university',
+  'scientific-publisher',
+]);
+
+const TRUSTED_SOURCE_TYPES = new Set([
+  ...PRIMARY_SOURCE_TYPES,
+  'newspaper',
+  'public-broadcaster',
+  'broadcaster',
+  'journalism',
+  'digital-news-site',
+  'fact-checker',
+]);
+
+const SECONDARY_EVIDENCE_DOMAINS = new Set([
+  'wikipedia.org',
+  'www.wikipedia.org',
+  'britannica.com',
+  'www.britannica.com',
 ]);
 
 const SYSTEM_PROMPT = `You are a credibility assessment engine for news articles and user-submitted news claims.
@@ -492,7 +548,12 @@ function normalizeAnalysisResponse(parsed, fallback = {}) {
   };
 }
 
-async function callOpenAIJson({ apiKey, payload, fallback }) {
+async function requestOpenAIJson({
+  apiKey,
+  payload,
+  systemPrompt = SYSTEM_PROMPT,
+  maxTokens = 1200,
+}) {
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -503,9 +564,9 @@ async function callOpenAIJson({ apiKey, payload, fallback }) {
       model: OPENAI_MODEL,
       response_format: { type: 'json_object' },
       temperature: 0.1,
-      max_tokens: 1200,
+      max_tokens: maxTokens,
       messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'system', content: systemPrompt },
         { role: 'user', content: JSON.stringify(payload, null, 2) },
       ],
     }),
@@ -529,6 +590,16 @@ async function callOpenAIJson({ apiKey, payload, fallback }) {
     throw new Error('OpenAI returned invalid JSON.');
   }
 
+  return parsed;
+}
+
+async function callOpenAIJson({ apiKey, payload, fallback }) {
+  const parsed = await requestOpenAIJson({
+    apiKey,
+    payload,
+    systemPrompt: SYSTEM_PROMPT,
+    maxTokens: 1200,
+  });
   return normalizeAnalysisResponse(parsed, fallback);
 }
 
@@ -744,85 +815,920 @@ export function isOpenAiConfigured(apiKey) {
   return Boolean(safeText(apiKey));
 }
 
-export async function analyzeSearchInput({ text = '', url = '', language = 'en', fileName = '', apiKey }) {
-  if (!safeText(text) && !safeText(url) && !safeText(fileName)) {
-    throw new Error('A claim, URL, or file name is required.');
+const QUESTION_NORMALIZATION_PROMPT = `You convert user questions into neutral factual claims for evidence checking.
+
+Rules:
+- Never judge the question itself as credible or not credible.
+- For yes/no questions, rewrite the question into a concise affirmative factual claim.
+- For who/what/when/where questions, do not invent an answer. If the answer must come from evidence, return normalizedClaim as null and provide a claimTemplate containing "{answer}".
+- Preserve the original entities, offices, places, and dates.
+- Keep the claim concise, neutral, and checkable.
+- Return valid JSON only with exactly this shape:
+{
+  "normalizedClaim": "string | null",
+  "needsAnswerFromEvidence": true,
+  "claimTemplate": "string | null",
+  "ambiguity": "string | null"
+}`;
+
+const ARTICLE_CLAIM_EXTRACTION_PROMPT = `Extract the 1 to 3 most important factual claims from a news article.
+
+Rules:
+- Prefer concrete claims from the headline and lead paragraphs.
+- Keep each claim short, neutral, and checkable.
+- Do not include opinions, speculation, or recommendations.
+- Return valid JSON only with exactly this shape:
+{
+  "claims": ["string"]
+}`;
+
+const EVIDENCE_SYNTHESIS_PROMPT = `You are an evidence-grounded claim verification engine.
+
+Use only the evidence pack provided by the user. Do not use outside knowledge.
+
+Important rules:
+- Never judge the user's question itself as credible or not credible.
+- Judge whether the underlying factual claim is supported by the retrieved evidence.
+- Keep source credibility separate from claim support.
+- Prefer official and primary sources when they are present.
+- If evidence is missing or weak, keep the score in the mixed / inconclusive band rather than calling the claim unsupported.
+- Lower confidence when there are few sources, conflicting sources, outdated sources, retrieval failures, or ambiguity.
+- For who/what/when/where questions, only fill in normalizedClaim if the evidence clearly supports a single answer-backed claim.
+
+Scoring bands:
+- 85 to 100: supported
+- 70 to 84: likely supported
+- 40 to 69: mixed / inconclusive
+- 20 to 39: likely unsupported
+- 0 to 19: unsupported
+
+Return valid JSON only with exactly this shape:
+{
+  "normalizedClaim": "string | null",
+  "claimSupportScore": 0,
+  "confidence": 0,
+  "explanation": "string",
+  "evidence": [
+    {
+      "title": "string",
+      "url": "string",
+      "source": "string",
+      "snippet": "string",
+      "stance": "supports | contradicts | context"
+    }
+  ],
+  "limitations": ["string"]
+}`;
+
+const CLAIM_SEARCH_STOPWORDS = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'can', 'did', 'do', 'does',
+  'for', 'from', 'has', 'have', 'how', 'in', 'is', 'it', 'its', 'of', 'on', 'or',
+  'pm', 'that', 'the', 'their', 'this', 'to', 'was', 'were', 'what', 'when', 'where',
+  'who', 'why', 'with',
+]);
+
+function tokenizeClaimSearchText(value) {
+  return normalizeClaimWhitespace(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .filter(token => token.length >= 3 && !CLAIM_SEARCH_STOPWORDS.has(token));
+}
+
+function ensureSentence(value) {
+  const text = normalizeClaimWhitespace(value).replace(/[.?!]+$/, '');
+  return text ? `${text}.` : '';
+}
+
+function buildClaimHeadline(value) {
+  const text = normalizeClaimWhitespace(value);
+  if (!text) return '';
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function isPrimarySource(source) {
+  return PRIMARY_SOURCE_TYPES.has(safeText(source?.sourceType).toLowerCase());
+}
+
+function isTrustedSource(source) {
+  return TRUSTED_SOURCE_TYPES.has(safeText(source?.sourceType).toLowerCase());
+}
+
+function scoreRegistrySourceForClaim(source, claimText) {
+  const tokens = tokenizeClaimSearchText(claimText);
+  const haystack = normalizeClaimWhitespace([
+    source?.sourceName,
+    source?.domain,
+    source?.country,
+    source?.category,
+    source?.description,
+    source?.editorialNotes,
+    Array.isArray(source?.tags) ? source.tags.join(' ') : '',
+  ].join(' ')).toLowerCase();
+
+  let score = 0;
+  tokens.forEach((token) => {
+    if (haystack.includes(token)) {
+      score += token.length > 5 ? 10 : 7;
+    }
+  });
+
+  if (isPrimarySource(source)) score += 18;
+  else if (safeText(source?.credibilityTier).toLowerCase() === 'very-high') score += 14;
+  else if (safeText(source?.credibilityTier).toLowerCase() === 'high') score += 10;
+
+  if (safeText(source?.country).toLowerCase() === 'singapore' && /\bsingapore|lawrence|wong|cpf|hdb|mas|moh\b/i.test(claimText)) {
+    score += 10;
   }
 
-  const claimText = safeText(text);
-  const sourceUrl = safeText(url);
-  const cacheKey = `search:${CREDIBILITY_OUTPUT_VERSION}:${hashText(JSON.stringify({ claimText, sourceUrl, language, fileName }))}`;
-  const cached = readTimedCache(searchCredibilityCache, cacheKey, CREDIBILITY_CACHE_TTL_MS);
-  if (cached) return cached;
+  return score;
+}
 
-  const extracted = sourceUrl
-    ? await extractArticle(sourceUrl, {
-      title: '',
-      description: '',
-      source: '',
-      publishedAt: '',
-      imageUrl: '',
-      author: '',
+function rankRegistrySourcesForClaim(claimText, sourceRegistry) {
+  const sources = Array.isArray(sourceRegistry?.sources) ? sourceRegistry.sources : [];
+  return [...sources]
+    .map(source => ({ source, score: scoreRegistrySourceForClaim(source, claimText) }))
+    .sort((left, right) => {
+      const primaryDelta = Number(isPrimarySource(right.source)) - Number(isPrimarySource(left.source));
+      if (primaryDelta !== 0) return primaryDelta;
+      return right.score - left.score;
+    });
+}
+
+function decodeDuckDuckGoResultUrl(value) {
+  const raw = decodeHtmlEntities(safeText(value)).replace(/&amp;/g, '&');
+  if (!raw) return '';
+
+  try {
+    const parsed = new URL(raw, 'https://duckduckgo.com');
+    if (parsed.hostname.endsWith('duckduckgo.com') && parsed.pathname.startsWith('/l/')) {
+      const target = parsed.searchParams.get('uddg');
+      return target ? decodeURIComponent(target) : parsed.toString();
+    }
+    return parsed.toString();
+  } catch {
+    return raw;
+  }
+}
+
+function parseDuckDuckGoResults(html) {
+  const results = [];
+  const anchorPattern = /<a[^>]*class=["'][^"']*result__a[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+
+  let match;
+  while ((match = anchorPattern.exec(html)) !== null && results.length < (MAX_EVIDENCE_RESULTS * 3)) {
+    const tail = html.slice(match.index, match.index + SEARCH_RESULT_WINDOW);
+    const snippetMatch = tail.match(/class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/(?:a|div)>/i);
+    const url = decodeDuckDuckGoResultUrl(match[1]);
+    const title = normalizeClaimWhitespace(stripHtml(match[2]));
+    const snippet = normalizeClaimWhitespace(stripHtml(snippetMatch?.[1] || ''));
+
+    if (!url || !title) continue;
+    results.push({ title, url, snippet });
+  }
+
+  return results;
+}
+
+async function searchDuckDuckGo(query) {
+  const encodedQuery = encodeURIComponent(normalizeClaimWhitespace(query));
+  let lastError = null;
+
+  for (const endpoint of DUCKDUCKGO_SEARCH_ENDPOINTS) {
+    try {
+      const response = await fetch(`${endpoint}?q=${encodedQuery}`, {
+        headers: {
+          'User-Agent': SEARCH_USER_AGENT,
+          'Accept': 'text/html,application/xhtml+xml',
+        },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Search request failed (${response.status})`);
+      }
+
+      const html = await response.text();
+      const results = parseDuckDuckGoResults(html);
+      if (results.length > 0) {
+        return results;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error('Search retrieval failed.');
+}
+
+function sourcePriorityForEvidence(source) {
+  if (!source) return 'secondary';
+  if (isPrimarySource(source)) return 'official';
+  if (isTrustedSource(source)) return 'trusted';
+  return 'reputable';
+}
+
+function scoreEvidenceCandidate(candidate, claimText) {
+  const tokens = tokenizeClaimSearchText(claimText);
+  const searchable = normalizeClaimWhitespace([
+    candidate?.title,
+    candidate?.snippet,
+    candidate?.matchedSource?.sourceName,
+    candidate?.matchedSource?.domain,
+  ].join(' ')).toLowerCase();
+
+  let score = 0;
+  tokens.forEach((token) => {
+    if (searchable.includes(token)) score += 8;
+  });
+
+  if (candidate?.sourcePriority === 'official') score += 28;
+  else if (candidate?.sourcePriority === 'trusted') score += 18;
+  else if (candidate?.sourcePriority === 'reputable') score += 10;
+
+  return score;
+}
+
+function dedupeEvidenceCandidates(candidates) {
+  const deduped = [];
+  const seen = new Set();
+
+  candidates.forEach((candidate) => {
+    const url = canonicalizeUrl(candidate?.url);
+    const key = url || normalizeDomain(candidate?.url) || candidate?.title;
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    deduped.push({ ...candidate, url });
+  });
+
+  return deduped;
+}
+
+async function searchClaimAcrossSources({ claimText, rankedSources }) {
+  const collected = [];
+  const triedQueries = new Set();
+  const officialSources = rankedSources
+    .filter(entry => entry.score > 0 && isPrimarySource(entry.source))
+    .slice(0, 3);
+  const trustedSources = rankedSources
+    .filter(entry => entry.score > 0 && !isPrimarySource(entry.source) && isTrustedSource(entry.source))
+    .slice(0, 3);
+
+  const queryPlans = [
+    ...officialSources.map(({ source }) => ({
+      query: `site:${source.domain} ${claimText}`,
+      allowedDomains: [source.domain],
+    })),
+    ...trustedSources.map(({ source }) => ({
+      query: `site:${source.domain} ${claimText}`,
+      allowedDomains: [source.domain],
+    })),
+    {
+      query: claimText,
+      allowedDomains: [
+        ...officialSources.map(item => item.source.domain),
+        ...trustedSources.map(item => item.source.domain),
+      ],
+    },
+    {
+      query: `${claimText} fact check`,
+      allowedDomains: [],
+    },
+  ];
+
+  for (const plan of queryPlans) {
+    if (collected.length >= MAX_EVIDENCE_RESULTS) break;
+    const normalizedQuery = normalizeClaimWhitespace(plan.query);
+    if (!normalizedQuery || triedQueries.has(normalizedQuery)) continue;
+    triedQueries.add(normalizedQuery);
+
+    try {
+      const results = await searchDuckDuckGo(normalizedQuery);
+      const filtered = [];
+
+      for (const result of results) {
+        const domain = extractDomainFromUrl(result.url);
+        const matchedSource = await getCredibleSourceByDomain(domain);
+        const isSecondary = SECONDARY_EVIDENCE_DOMAINS.has(domain);
+
+        if (Array.isArray(plan.allowedDomains) && plan.allowedDomains.length > 0) {
+          const allowed = plan.allowedDomains.some(allowedDomain => (
+            domain === allowedDomain || domain.endsWith(`.${allowedDomain}`)
+          ));
+          if (!allowed) continue;
+        } else if (!matchedSource && !isSecondary) {
+          continue;
+        }
+
+        filtered.push({
+          ...result,
+          domain,
+          matchedSource,
+          sourcePriority: isSecondary ? 'secondary' : sourcePriorityForEvidence(matchedSource),
+        });
+      }
+
+      collected.push(...filtered);
+    } catch {
+      // Continue through the retrieval plan and let the final fallback state explain the failure.
+    }
+  }
+
+  return dedupeEvidenceCandidates(collected)
+    .sort((left, right) => scoreEvidenceCandidate(right, claimText) - scoreEvidenceCandidate(left, claimText))
+    .slice(0, MAX_EVIDENCE_RESULTS);
+}
+
+async function retrieveEvidenceForClaim({ claimText }) {
+  const sourceRegistry = await loadCredibleSources();
+  const rankedSources = rankRegistrySourcesForClaim(claimText, sourceRegistry);
+  const candidates = await searchClaimAcrossSources({ claimText, rankedSources });
+
+  const enriched = await runWithConcurrency(candidates.slice(0, 4), 2, async (candidate) => {
+    const extracted = await extractArticle(candidate.url, {
+      title: candidate.title,
+      description: candidate.snippet,
+      source: candidate.matchedSource?.sourceName || candidate.domain,
+    });
+
+    const summary = buildSummaryFromText({
+      title: pickFirst(extracted?.title, candidate.title),
+      description: pickFirst(extracted?.description, candidate.snippet),
+      content: extracted?.content,
+    });
+
+    return {
+      title: pickFirst(extracted?.title, candidate.title),
+      url: candidate.url,
+      source: pickFirst(
+        candidate.matchedSource?.sourceName,
+        extracted?.siteName,
+        candidate.domain
+      ),
+      snippet: pickFirst(summary, candidate.snippet),
+      publishedAt: pickFirst(extracted?.publishedAt),
+      sourcePriority: candidate.sourcePriority,
+      domain: candidate.domain,
+      matchedSource: candidate.matchedSource
+        ? {
+            sourceName: candidate.matchedSource.sourceName,
+            domain: candidate.matchedSource.domain,
+            sourceType: candidate.matchedSource.sourceType,
+            credibilityTier: candidate.matchedSource.credibilityTier,
+          }
+        : null,
+    };
+  });
+
+  return {
+    rankedSources,
+    evidence: dedupeEvidenceCandidates(enriched).slice(0, MAX_EVIDENCE_RESULTS),
+  };
+}
+
+function buildHeuristicEvidenceJudgment({
+  normalizedClaim,
+  evidence,
+  retrievalFailed = false,
+  limitations = [],
+}) {
+  const claimTokens = tokenizeClaimSearchText(normalizedClaim);
+  let supports = 0;
+  let contradicts = 0;
+
+  const judgedEvidence = evidence.map((item) => {
+    const text = normalizeClaimWhitespace(`${item.title} ${item.snippet}`).toLowerCase();
+    const overlap = claimTokens.filter(token => text.includes(token)).length;
+    const contradictionMarkers = /\b(false|not true|myth|debunk|incorrect|inaccurate|unsupported|no evidence|is not|are not|was not|were not|did not|does not|has not|have not)\b/i.test(text);
+    const supportMarkers = overlap >= Math.max(2, Math.floor(claimTokens.length / 3));
+
+    let stance = 'context';
+    if (contradictionMarkers && overlap >= 1) {
+      stance = 'contradicts';
+      contradicts += 1;
+    } else if (supportMarkers) {
+      stance = 'supports';
+      supports += 1;
+    }
+
+    return {
+      title: item.title,
+      url: item.url,
+      source: item.source,
+      snippet: item.snippet,
+      stance,
+    };
+  });
+
+  let claimSupportScore = 50;
+  if (supports > 0 && contradicts === 0) {
+    claimSupportScore = 72 + Math.min(24, (supports * 8));
+  } else if (contradicts > 0 && supports === 0) {
+    claimSupportScore = Math.max(4, 32 - (contradicts * 10));
+  } else if (supports > 0 || contradicts > 0) {
+    claimSupportScore = 52 + (supports * 6) - (contradicts * 8);
+  } else if (retrievalFailed) {
+    claimSupportScore = 50;
+  }
+
+  const contradictory = supports > 0 && contradicts > 0;
+  const confidence = deriveConfidence({
+    evidence: judgedEvidence,
+    retrievalFailed,
+    contradictory,
+    fallback: 46,
+  });
+
+  const verdict = verdictFromClaimSupportScore(claimSupportScore);
+  let explanation = 'Available evidence is limited, so this remains inconclusive.';
+  if (verdict === CLAIM_VERDICTS.SUPPORTED || verdict === CLAIM_VERDICTS.LIKELY_SUPPORTED) {
+    explanation = 'Trusted sources generally support this claim.';
+  } else if (verdict === CLAIM_VERDICTS.UNSUPPORTED || verdict === CLAIM_VERDICTS.LIKELY_UNSUPPORTED) {
+    explanation = 'Trusted sources do not support this claim.';
+  } else if (contradictory) {
+    explanation = 'Retrieved sources point in different directions, so the evidence is mixed.';
+  }
+
+  return {
+    normalizedClaim,
+    claimSupportScore: clampScore(claimSupportScore, 50),
+    confidence,
+    explanation,
+    evidence: judgedEvidence,
+    limitations,
+  };
+}
+
+async function normalizeQuestionWithEvidenceContext({ question, language, apiKey }) {
+  const heuristic = normalizeQuestionToClaimHeuristic(question);
+  if (!isOpenAiConfigured(apiKey)) return heuristic;
+
+  try {
+    const response = await requestOpenAIJson({
+      apiKey,
+      systemPrompt: QUESTION_NORMALIZATION_PROMPT,
+      maxTokens: 220,
+      payload: {
+        preferredOutputLanguage: safeText(language, 'en'),
+        preferredOutputLanguageName: resolveOutputLanguageName(language),
+        question,
+      },
+    });
+
+    return {
+      normalizedClaim: safeText(response?.normalizedClaim) || heuristic.normalizedClaim || null,
+      needsAnswerFromEvidence: Boolean(response?.needsAnswerFromEvidence ?? heuristic.needsAnswerFromEvidence),
+      claimTemplate: safeText(response?.claimTemplate) || heuristic.claimTemplate || null,
+      ambiguity: safeText(response?.ambiguity) || null,
+    };
+  } catch {
+    return heuristic;
+  }
+}
+
+async function extractArticleClaims({ article, language, apiKey }) {
+  const fallbackClaims = [
+    buildClaimHeadline(pickFirst(article?.title, article?.description)),
+    buildClaimHeadline(article?.summary),
+  ].filter(Boolean).slice(0, 2);
+
+  if (!isOpenAiConfigured(apiKey)) {
+    return fallbackClaims.slice(0, MAX_CLAIMS_TO_CHECK);
+  }
+
+  try {
+    const response = await requestOpenAIJson({
+      apiKey,
+      systemPrompt: ARTICLE_CLAIM_EXTRACTION_PROMPT,
+      maxTokens: 260,
+      payload: {
+        preferredOutputLanguage: safeText(language, 'en'),
+        preferredOutputLanguageName: resolveOutputLanguageName(language),
+        headline: safeText(article?.title),
+        sourceName: safeText(article?.source),
+        description: safeText(article?.description),
+        summary: safeText(article?.summary),
+        fullBodyText: safeText(article?.content || article?.scrapedContent).slice(0, MAX_BODY_CHARACTERS),
+      },
+    });
+
+    const claims = Array.isArray(response?.claims)
+      ? response.claims.map(item => ensureSentence(item)).filter(Boolean)
+      : [];
+
+    return claims.length > 0
+      ? claims.slice(0, MAX_CLAIMS_TO_CHECK)
+      : fallbackClaims.slice(0, MAX_CLAIMS_TO_CHECK);
+  } catch {
+    return fallbackClaims.slice(0, MAX_CLAIMS_TO_CHECK);
+  }
+}
+
+async function synthesizeClaimSupport({
+  originalInput,
+  inputType,
+  questionContext,
+  normalizedClaim,
+  evidence,
+  language,
+  apiKey,
+  limitations = [],
+}) {
+  if (evidence.length === 0) {
+    return buildHeuristicEvidenceJudgment({
+      normalizedClaim,
+      evidence: [],
+      retrievalFailed: true,
+      limitations: [
+        ...limitations,
+        'Trusted-source retrieval did not return enough usable evidence.',
+      ],
+    });
+  }
+
+  if (!isOpenAiConfigured(apiKey)) {
+    return buildHeuristicEvidenceJudgment({
+      normalizedClaim,
+      evidence,
+      retrievalFailed: false,
+      limitations,
+    });
+  }
+
+  try {
+    const response = await requestOpenAIJson({
+      apiKey,
+      systemPrompt: EVIDENCE_SYNTHESIS_PROMPT,
+      maxTokens: 900,
+      payload: {
+        preferredOutputLanguage: safeText(language, 'en'),
+        preferredOutputLanguageName: resolveOutputLanguageName(language),
+        inputType,
+        originalInput,
+        questionContext: questionContext || null,
+        normalizedClaim: normalizedClaim || null,
+        evidencePack: evidence,
+        limitations,
+      },
+    });
+
+    return buildClaimCheckResult({
+      inputType,
+      originalInput,
+      normalizedClaim: safeText(response?.normalizedClaim) || normalizedClaim || null,
+      claimSupportScore: clampScore(response?.claimSupportScore, 50),
+      confidence: clampScore(response?.confidence, 45),
+      explanation: safeText(response?.explanation) || 'Available evidence is mixed.',
+      evidence: Array.isArray(response?.evidence) && response.evidence.length > 0
+        ? response.evidence
+        : evidence,
+      limitations: Array.isArray(response?.limitations)
+        ? [...limitations, ...response.limitations]
+        : limitations,
+    });
+  } catch {
+    return buildHeuristicEvidenceJudgment({
+      normalizedClaim,
+      evidence,
+      retrievalFailed: false,
+      limitations: [
+        ...limitations,
+        'Model-based evidence synthesis was unavailable, so a heuristic fallback was used.',
+      ],
+    });
+  }
+}
+
+function deriveSourceCredibilityScore(localAssessment, credibleSourceSimilarity) {
+  const baseline = clampScore(localAssessment?.credibilityDetail?.credibilityScore, 50);
+  const similarityScore = clampScore(credibleSourceSimilarity?.similarityScore, baseline);
+
+  if (credibleSourceSimilarity?.exactDomainMatch) {
+    return clampScore(Math.round((baseline * 0.7) + (similarityScore * 0.3)), baseline);
+  }
+
+  if (credibleSourceSimilarity?.status === 'ready' && similarityScore > baseline) {
+    return clampScore(Math.round((baseline * 0.8) + (similarityScore * 0.2)), baseline);
+  }
+
+  return baseline;
+}
+
+function buildSourceCredibilityExplanation(score) {
+  if (score >= 75) {
+    return 'This source appears reputable, but individual claims should still be checked.';
+  }
+  if (score <= 39) {
+    return 'This source appears weak, but some claims may still be accurate.';
+  }
+  return 'This source has mixed reputation signals, so claim-level evidence matters more than the domain alone.';
+}
+
+function buildNextStepForVerdict(verdict, inputType) {
+  if (verdict === CLAIM_VERDICTS.SUPPORTED || verdict === CLAIM_VERDICTS.LIKELY_SUPPORTED) {
+    return inputType === CLAIM_INPUT_TYPES.URL_ARTICLE
+      ? 'This source may be usable, but verify any high-stakes claims directly with primary sources.'
+      : 'Evidence suggests this claim is supported, but check primary sources for high-stakes decisions.';
+  }
+
+  if (verdict === CLAIM_VERDICTS.UNSUPPORTED || verdict === CLAIM_VERDICTS.LIKELY_UNSUPPORTED) {
+    return 'Available evidence does not support this claim. Verify against official or primary sources before sharing it.';
+  }
+
+  return 'Evidence is mixed or incomplete. Look for additional official or primary sources before relying on this.';
+}
+
+function createSearchResultEnvelope({
+  baseResult,
+  detectedLanguage,
+  originalInput,
+  originalClaim,
+  headline = '',
+  articleSummary = '',
+  sourceCredibilityExplanation = '',
+  checkedClaims = [],
+  credibleSourceSimilarity = null,
+  sourceDetails = null,
+}) {
+  const legacyCredibility = legacyCredibilityFromVerdict(baseResult.verdict);
+
+  return {
+    ...baseResult,
+    detectedLanguage,
+    originalInput,
+    originalClaim,
+    headline,
+    articleSummary,
+    sourceCredibilityExplanation,
+    recommendedNextStep: buildNextStepForVerdict(baseResult.verdict, baseResult.inputType),
+    checkedClaims,
+    sourceDetails,
+    credibleSourceSimilarity,
+    credibility: legacyCredibility,
+    appCredibility: legacyCredibility,
+    score: baseResult.claimSupportScore,
+    confidenceScore: baseResult.confidence,
+  };
+}
+
+async function analyzeClaimLikeInput({
+  originalInput,
+  inputType,
+  language,
+  apiKey,
+  fileName,
+  hasUserText = true,
+}) {
+  const questionNormalization = inputType === CLAIM_INPUT_TYPES.OPEN_ENDED_QUESTION
+    ? await normalizeQuestionWithEvidenceContext({
+      question: originalInput,
+      language,
+      apiKey,
     })
     : null;
+  const screenshotWithoutText = inputType === CLAIM_INPUT_TYPES.SCREENSHOT_OR_EXTRACTED_TEXT
+    && !hasUserText;
+
+  const normalizedClaim = inputType === CLAIM_INPUT_TYPES.OPEN_ENDED_QUESTION
+    ? questionNormalization?.normalizedClaim
+    : screenshotWithoutText
+      ? null
+      : ensureSentence(originalInput);
+
+  const retrievalQuery = normalizeClaimWhitespace(
+    normalizedClaim
+    || originalInput
+    || fileName
+  );
+  const retrieval = screenshotWithoutText
+    ? { evidence: [] }
+    : await retrieveEvidenceForClaim({ claimText: retrievalQuery });
+  const limitations = [];
+
+  if (inputType === CLAIM_INPUT_TYPES.SCREENSHOT_OR_EXTRACTED_TEXT) {
+    limitations.push('This input came from the screenshot / extracted-text flow. OCR quality or missing context may affect the result.');
+    if (screenshotWithoutText) {
+      limitations.push('No extracted text was available, so the screenshot could not be turned into a checkable claim.');
+    }
+  }
+
+  if (questionNormalization?.ambiguity) {
+    limitations.push(questionNormalization.ambiguity);
+  }
+
+  const synthesized = await synthesizeClaimSupport({
+    originalInput,
+    inputType,
+    questionContext: inputType === CLAIM_INPUT_TYPES.OPEN_ENDED_QUESTION ? originalInput : null,
+    normalizedClaim,
+    evidence: retrieval.evidence,
+    language,
+    apiKey,
+    limitations,
+  });
+
+  const result = buildClaimCheckResult({
+    ...synthesized,
+    inputType,
+    originalInput,
+    normalizedClaim: synthesized.normalizedClaim || normalizedClaim,
+  });
+
+  return createSearchResultEnvelope({
+    baseResult: result,
+    detectedLanguage: detectLanguage(originalInput),
+    originalInput,
+    originalClaim: originalInput,
+    headline: buildClaimHeadline(result.normalizedClaim || originalInput),
+    articleSummary: '',
+    sourceCredibilityExplanation: '',
+    checkedClaims: result.normalizedClaim ? [{ claim: result.normalizedClaim, score: result.claimSupportScore }] : [],
+    credibleSourceSimilarity: null,
+    sourceDetails: null,
+  });
+}
+
+async function analyzeUrlArticleInput({
+  sourceUrl,
+  language,
+  apiKey,
+}) {
+  const extracted = await extractArticle(sourceUrl, {
+    title: '',
+    description: '',
+    source: '',
+    publishedAt: '',
+    imageUrl: '',
+    author: '',
+  });
+
+  const articleShell = {
+    title: extracted?.title,
+    description: extracted?.description,
+    source: extracted?.siteName,
+    url: sourceUrl,
+    originalUrl: sourceUrl,
+    publishedAt: extracted?.publishedAt,
+    content: extracted?.content,
+    scrapedContent: extracted?.content,
+  };
 
   const articleSummary = buildSummaryFromText({
-    title: pickFirst(extracted?.title, claimText),
+    title: extracted?.title,
     description: extracted?.description,
     content: extracted?.content,
   });
 
-  const fallback = {
-    headline: pickFirst(extracted?.title, claimText, fileName, sourceUrl),
-    articleSummary,
-  };
+  const sourceRegistry = await loadCredibleSources();
+  const localAssessment = buildInitialArticleCredibility(articleShell, sourceRegistry);
 
-  const analysis = await callOpenAIJson({
-    apiKey,
-    fallback,
-    payload: {
-      mode: 'search',
-      preferredOutputLanguage: safeText(language, 'en'),
-      preferredOutputLanguageName: resolveOutputLanguageName(language),
-      userClaim: claimText,
-      fileName: safeText(fileName),
-      article: sourceUrl ? {
-        headline: extracted?.title || '',
-        sourceName: extracted?.siteName || '',
-        originalArticleUrl: sourceUrl,
-        publishDate: extracted?.publishedAt || '',
-        articleSummary,
-        fullBodyText: extracted?.content || '',
-      } : null,
-      instructions: 'Assess the credibility of the provided claim or linked article using only the supplied information.',
-    },
-  });
-
-  const result = {
-    ...analysis,
-    detectedLanguage: detectLanguage(claimText || extracted?.content),
-    originalClaim: claimText || sourceUrl || fileName,
-    urlContent: extracted?.success ? {
-      title: extracted.title,
-      siteName: extracted.siteName,
-    } : null,
-    articleCredibility: buildArticleCredibilityObject(analysis),
-  };
-
+  let credibleSourceSimilarity = null;
   try {
-    result.credibleSourceSimilarity = await evaluateCredibleSourceSimilarity({
-      title: pickFirst(extracted?.title, claimText, fileName),
+    credibleSourceSimilarity = await evaluateCredibleSourceSimilarity({
+      title: extracted?.title || '',
       source: extracted?.siteName || '',
       url: sourceUrl,
       originalUrl: sourceUrl,
       summary: articleSummary,
       description: extracted?.description || '',
-      scrapedContent: extracted?.content || claimText,
+      scrapedContent: extracted?.content || '',
       requestedLanguage: language,
     });
   } catch (error) {
-    result.credibleSourceSimilarity = buildUnavailableSourceSimilarity(error?.message || 'Credible source similarity unavailable.');
+    credibleSourceSimilarity = buildUnavailableSourceSimilarity(error?.message || 'Credible source similarity unavailable.');
   }
+
+  const sourceCredibilityScore = deriveSourceCredibilityScore(localAssessment, credibleSourceSimilarity);
+  const checkedClaims = [];
+  const claims = await extractArticleClaims({
+    article: {
+      ...articleShell,
+      summary: articleSummary,
+    },
+    language,
+    apiKey,
+  });
+
+  for (const claim of claims) {
+    const retrieval = await retrieveEvidenceForClaim({ claimText: claim });
+    const synthesized = await synthesizeClaimSupport({
+      originalInput: sourceUrl,
+      inputType: CLAIM_INPUT_TYPES.URL_ARTICLE,
+      questionContext: null,
+      normalizedClaim: claim,
+      evidence: retrieval.evidence,
+      language,
+      apiKey,
+      limitations: [],
+    });
+
+    checkedClaims.push({
+      claim,
+      score: clampScore(synthesized.claimSupportScore, 50),
+      verdict: verdictFromClaimSupportScore(synthesized.claimSupportScore),
+      evidence: Array.isArray(synthesized.evidence) ? synthesized.evidence.slice(0, 3) : [],
+      explanation: synthesized.explanation,
+    });
+  }
+
+  const aggregateSupportScore = checkedClaims.length > 0
+    ? clampScore(Math.round(
+      checkedClaims.reduce((total, item) => total + item.score, 0) / checkedClaims.length
+    ), 50)
+    : 50;
+  const aggregateConfidence = deriveConfidence({
+    evidence: checkedClaims.flatMap(item => item.evidence || []).slice(0, MAX_EVIDENCE_RESULTS),
+    retrievalFailed: checkedClaims.length === 0,
+    contradictory: checkedClaims.some(item => item.verdict === CLAIM_VERDICTS.LIKELY_UNSUPPORTED || item.verdict === CLAIM_VERDICTS.UNSUPPORTED)
+      && checkedClaims.some(item => item.verdict === CLAIM_VERDICTS.SUPPORTED || item.verdict === CLAIM_VERDICTS.LIKELY_SUPPORTED),
+    fallback: 48,
+  });
+
+  const allEvidence = dedupeEvidenceCandidates(
+    checkedClaims.flatMap(item => item.evidence || [])
+  ).slice(0, MAX_EVIDENCE_RESULTS);
+
+  const limitations = [];
+  if (!extracted?.success) {
+    limitations.push('Full article extraction was incomplete, so the article claims may not have been fully captured.');
+  }
+  if (checkedClaims.length === 0) {
+    limitations.push('No clear article claims were extracted for external verification.');
+  }
+
+  const baseResult = buildClaimCheckResult({
+    inputType: CLAIM_INPUT_TYPES.URL_ARTICLE,
+    originalInput: sourceUrl,
+    normalizedClaim: null,
+    sourceCredibilityScore,
+    claimSupportScore: aggregateSupportScore,
+    confidence: aggregateConfidence,
+    explanation: checkedClaims.length > 0
+      ? checkedClaims[0].explanation
+      : 'The article source could be assessed, but evidence retrieval for its main claims was limited.',
+    evidence: allEvidence,
+    limitations,
+  });
+
+  return createSearchResultEnvelope({
+    baseResult,
+    detectedLanguage: detectLanguage(`${extracted?.title || ''} ${extracted?.content || ''}`),
+    originalInput: sourceUrl,
+    originalClaim: sourceUrl,
+    headline: extracted?.title || sourceUrl,
+    articleSummary,
+    sourceCredibilityExplanation: buildSourceCredibilityExplanation(sourceCredibilityScore),
+    checkedClaims,
+    credibleSourceSimilarity,
+    sourceDetails: {
+      domain: normalizeDomain(sourceUrl),
+      sourceName: pickFirst(extracted?.siteName, normalizeDomain(sourceUrl)),
+    },
+  });
+}
+
+export async function analyzeSearchInput({ text = '', url = '', language = 'en', fileName = '', apiKey }) {
+  if (!safeText(text) && !safeText(url) && !safeText(fileName)) {
+    throw new Error('A claim, URL, or file name is required.');
+  }
+
+  const typedText = safeText(text);
+  const detectedUrl = safeText(url) || extractFirstUrl(typedText);
+  const inputType = detectClaimInputType({
+    text: typedText,
+    url: detectedUrl,
+    fileName,
+    fromScreenshot: Boolean(fileName),
+  });
+  const originalInput = inputType === CLAIM_INPUT_TYPES.URL_ARTICLE
+    ? detectedUrl
+    : typedText || fileName;
+
+  const cacheKey = `search:${CREDIBILITY_OUTPUT_VERSION}:${hashText(JSON.stringify({
+    inputType,
+    originalInput,
+    language,
+    fileName,
+  }))}`;
+  const cached = readTimedCache(searchCredibilityCache, cacheKey, CREDIBILITY_CACHE_TTL_MS);
+  if (cached) return cached;
+
+  const result = inputType === CLAIM_INPUT_TYPES.URL_ARTICLE
+    ? await analyzeUrlArticleInput({
+      originalInput,
+      sourceUrl: detectedUrl,
+      language,
+      apiKey,
+    })
+    : await analyzeClaimLikeInput({
+      originalInput,
+      inputType,
+      language,
+      apiKey,
+      fileName,
+      hasUserText: Boolean(typedText),
+    });
 
   writeTimedCache(searchCredibilityCache, cacheKey, result);
   return result;

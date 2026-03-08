@@ -1,21 +1,95 @@
-// Search Result page — displays credibility analysis from OpenAI or local engine
-// Handles both OpenAI structured response and legacy local format
 import { useLocation, Link } from 'react-router-dom';
 import { useLanguage } from '../context/LanguageContext';
 import CredibleSourceSignalPanel from '../components/CredibleSourceSignalPanel';
-import CredibilityMeter from '../components/CredibilityMeter';
-import SourceSignalPanel from '../components/SourceSignalPanel';
 import { Button } from '../components/ui/moving-border';
 import {
   localizeCredibilityList,
   localizeCredibilityText,
 } from '../utils/localizedCredibilityCopy';
 
+function verdictTone(verdict) {
+  if (verdict === 'supported' || verdict === 'likely_supported') return 'credible';
+  if (verdict === 'likely_unsupported' || verdict === 'unsupported') return 'notCredible';
+  return 'mixed';
+}
+
+function verdictLabel(verdict, t) {
+  const key = `search.verdictLabels.${verdict}`;
+  const translated = t(key);
+  return translated === key ? verdict : translated;
+}
+
+function verdictSummary(verdict, inputType, t) {
+  const baseKey = inputType === 'url_article'
+    ? 'search.articleVerdictSummary'
+    : 'search.claimVerdictSummary';
+  const translated = t(`${baseKey}.${verdict}`);
+  return translated === `${baseKey}.${verdict}`
+    ? t(`search.claimVerdictSummary.${verdict}`)
+    : translated;
+}
+
+function scoreTone(score) {
+  if (score >= 70) return 'credible';
+  if (score >= 40) return 'mixed';
+  return 'notCredible';
+}
+
+function resolveLanguageLabel(languageCode, t) {
+  const key = `languages.${languageCode}`;
+  const translated = t(key);
+  return translated === key ? (languageCode || 'en').toUpperCase() : translated;
+}
+
+function ScoreCard({ label, score, helper, toneOverride = '' }) {
+  const tone = toneOverride || (score === null || score === undefined ? 'mixed' : scoreTone(score));
+
+  return (
+    <div style={{
+      background: 'var(--bg-card)',
+      borderRadius: 'var(--radius-xl)',
+      border: '1px solid var(--border-light)',
+      padding: 'var(--space-5)',
+      minWidth: 0,
+    }}>
+      <div style={{
+        fontSize: 'var(--text-xs)',
+        letterSpacing: '0.08em',
+        textTransform: 'uppercase',
+        color: 'var(--text-tertiary)',
+        marginBottom: 'var(--space-2)',
+      }}>
+        {label}
+      </div>
+      <div style={{
+        display: 'flex',
+        alignItems: 'baseline',
+        gap: 'var(--space-2)',
+        marginBottom: 'var(--space-3)',
+      }}>
+        <span className={`credibility-meter-label ${tone}`} style={{ fontSize: 'var(--text-3xl)' }}>
+          {score ?? '—'}
+        </span>
+        <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--text-sm)' }}>/100</span>
+      </div>
+      {helper && (
+        <div style={{
+          fontSize: 'var(--text-sm)',
+          color: 'var(--text-secondary)',
+          lineHeight: 'var(--leading-normal)',
+        }}>
+          {helper}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function SearchResult() {
   const { t } = useLanguage();
   const location = useLocation();
   const result = location.state?.result;
-  const source = location.state?.source || 'local'; // 'openai' or 'local'
+  const source = location.state?.source || 'local';
   const aiError = location.state?.aiError;
 
   if (!result) {
@@ -39,42 +113,33 @@ export default function SearchResult() {
     );
   }
 
-  // Normalize result to handle both formats
-  const isOpenAI = source === 'openai';
-  const headline = result.headline || result.originalClaim || '';
-  const summary = result.articleSummary || result.summary || '';
-  const explanation = result.explanation || '';
-  const keyFindings = localizeCredibilityList(
-    Array.isArray(result.keyFindings) ? result.keyFindings : [],
-    t
-  );
-  const timeline = Array.isArray(result.timeline) ? result.timeline : [];
-  const recommendedNextStep = localizeCredibilityText(
-    result.recommendedNextStep || result.recommendation?.action || '',
-    t
-  );
-  const relatedResources = Array.isArray(result.relatedResourceHints) ? result.relatedResourceHints : [];
-  const signals = result.signals && typeof result.signals === 'object' ? result.signals : null;
+  const inputType = result.inputType || 'plain_claim';
+  const isUrl = inputType === 'url_article';
+  const verdict = result.verdict || 'mixed';
+  const verdictToneClass = verdictTone(verdict);
   const detectedLanguage = result.detectedLanguage || 'en';
-  const credibleSourceSimilarity = result.credibleSourceSimilarity || null;
-
-  const resolveLanguageLabel = (languageCode) => {
-    const key = `languages.${languageCode}`;
-    const translated = t(key);
-    return translated === key ? (languageCode || 'en').toUpperCase() : translated;
-  };
+  const evidence = Array.isArray(result.evidence) ? result.evidence : [];
+  const checkedClaims = Array.isArray(result.checkedClaims) ? result.checkedClaims : [];
+  const limitations = localizeCredibilityList(
+    Array.isArray(result.limitations) ? result.limitations : [],
+    t
+  );
+  const explanation = localizeCredibilityText(result.explanation || '', t);
+  const originalInput = result.originalInput || result.originalClaim || result.headline || '';
+  const normalizedClaim = result.normalizedClaim || null;
+  const confidence = result.confidence ?? result.confidenceScore ?? 0;
+  const sourceCredibilityScore = result.sourceCredibilityScore;
+  const claimSupportScore = result.claimSupportScore ?? result.score ?? 0;
+  const verdictCopy = verdictSummary(verdict, inputType, t);
 
   return (
     <div className="page" id="search-result-page">
       <div className="container page-content">
-        <div className="search-result-page animate-fade-in" style={{ maxWidth: '800px', margin: '0 auto' }}>
-
-          {/* Back to search */}
+        <div className="search-result-page animate-fade-in" style={{ maxWidth: '860px', margin: '0 auto' }}>
           <Link to="/search" className="article-detail-back" id="back-to-search">
             {t('search.newSearch')}
           </Link>
 
-          {/* AI source indicator */}
           {aiError && (
             <div style={{
               padding: 'var(--space-3) var(--space-4)',
@@ -88,201 +153,237 @@ export default function SearchResult() {
             </div>
           )}
 
-          {/* Original claim */}
           <div className="search-result-claim" id="result-claim">
-            <div className="search-result-claim-label">{t('search.claim')}</div>
-            <div className="search-result-claim-text">{result.originalClaim || headline}</div>
+            <div className="search-result-claim-label">
+              {isUrl ? t('search.articleChecked') : t('search.claimChecked')}
+            </div>
+            <div className="search-result-claim-text">{originalInput}</div>
           </div>
 
-          {/* Detected language + source badge */}
-          <div style={{ display: 'flex', gap: 'var(--space-3)', marginBottom: 'var(--space-6)', flexWrap: 'wrap' }}>
-            <div className="search-result-detected-lang">
-              {t('search.detectedLanguage')}: <strong style={{ marginLeft: '4px' }}>{resolveLanguageLabel(detectedLanguage)}</strong>
+          {normalizedClaim && normalizedClaim !== originalInput && (
+            <div className="summary-card" style={{ marginBottom: 'var(--space-5)' }}>
+              <h3 className="summary-card-title">{t('search.underlyingClaim')}</h3>
+              <p style={{
+                fontSize: 'var(--text-sm)',
+                color: 'var(--text-secondary)',
+                lineHeight: 'var(--leading-normal)',
+              }}>
+                {normalizedClaim}
+              </p>
             </div>
-            {isOpenAI && (
+          )}
+
+          <div style={{ display: 'flex', gap: 'var(--space-3)', marginBottom: 'var(--space-5)', flexWrap: 'wrap' }}>
+            <div className="search-result-detected-lang">
+              {t('search.detectedLanguage')}: <strong style={{ marginLeft: '4px' }}>{resolveLanguageLabel(detectedLanguage, t)}</strong>
+            </div>
+            <div className="search-result-detected-lang" style={{ background: 'var(--bg-secondary)' }}>
+              {t('search.inputType')}: <strong style={{ marginLeft: '4px' }}>{t(`search.inputTypes.${inputType}`)}</strong>
+            </div>
+            <div className="search-result-detected-lang" style={{ background: `var(--${verdictToneClass === 'credible' ? 'credible' : verdictToneClass === 'notCredible' ? 'not-credible' : 'mixed'}-bg)`, color: `var(--${verdictToneClass === 'credible' ? 'credible' : verdictToneClass === 'notCredible' ? 'not-credible' : 'mixed'})` }}>
+              {t('search.evidenceVerdict')}: <strong style={{ marginLeft: '4px' }}>{verdictLabel(verdict, t)}</strong>
+            </div>
+            {source === 'openai' && (
               <div className="search-result-detected-lang" style={{ background: 'var(--accent-primary-bg)', color: 'var(--accent-primary)' }}>
                 {t('search.poweredByAI')}
               </div>
             )}
           </div>
 
-          <div style={{ marginBottom: 'var(--space-6)' }}>
-            <CredibilityMeter
-              credibility={result.verdict || result.credibility}
-              confidence={result.confidenceScore ?? result.confidence}
-              score={result.credibilityScore ?? result.score ?? result.confidence}
-              signals={signals}
-              explanation={explanation}
-              rating={result.rating}
+          <div style={{
+            background: 'var(--bg-card)',
+            borderRadius: 'var(--radius-xl)',
+            border: '1px solid var(--border-light)',
+            padding: 'var(--space-6)',
+            marginBottom: 'var(--space-5)',
+          }}>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 'var(--space-3)',
+              flexWrap: 'wrap',
+              marginBottom: 'var(--space-4)',
+            }}>
+              <div>
+                <div style={{
+                  fontSize: 'var(--text-xs)',
+                  letterSpacing: '0.08em',
+                  textTransform: 'uppercase',
+                  color: 'var(--text-tertiary)',
+                  marginBottom: 'var(--space-1)',
+                }}>
+                  {t('search.evidenceVerdict')}
+                </div>
+                <div className={`credibility-meter-label ${verdictToneClass}`} style={{ fontSize: 'var(--text-2xl)' }}>
+                  {verdictLabel(verdict, t)}
+                </div>
+              </div>
+              <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
+                {t('article.confidence')}: <strong>{confidence}/100</strong>
+              </div>
+            </div>
+            <p style={{
+              fontSize: 'var(--text-base)',
+              color: 'var(--text-primary)',
+              lineHeight: 'var(--leading-normal)',
+              margin: 0,
+            }}>
+              {verdictCopy}
+            </p>
+          </div>
+
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: isUrl ? 'repeat(auto-fit, minmax(220px, 1fr))' : 'repeat(auto-fit, minmax(220px, 1fr))',
+            gap: 'var(--space-4)',
+            marginBottom: 'var(--space-6)',
+          }}>
+            {isUrl && (
+              <ScoreCard
+                label={t('search.sourceCredibility')}
+                score={sourceCredibilityScore}
+                helper={result.sourceCredibilityExplanation || t('search.sourceCredibilityHelp')}
+              />
+            )}
+            <ScoreCard
+              label={t('search.claimSupport')}
+              score={claimSupportScore}
+              helper={isUrl ? t('search.claimSupportHelpArticle') : t('search.claimSupportHelp')}
+            />
+            <ScoreCard
+              label={t('article.confidence')}
+              score={confidence}
+              helper={t('search.confidenceHelp')}
+              toneOverride={scoreTone(confidence)}
             />
           </div>
 
-          {credibleSourceSimilarity && (
+          {result.credibleSourceSimilarity && isUrl && (
             <div style={{ marginBottom: 'var(--space-6)' }}>
-              <CredibleSourceSignalPanel signal={credibleSourceSimilarity} />
+              <CredibleSourceSignalPanel signal={result.credibleSourceSimilarity} />
             </div>
           )}
 
-          {/* ── HEADLINE ────────────────────────────────────────────── */}
-          {headline && headline !== result.originalClaim && (
-            <h2 style={{
-              fontFamily: 'var(--font-serif)',
-              fontSize: 'var(--text-2xl)',
-              fontWeight: 700,
-              marginBottom: 'var(--space-6)',
-              lineHeight: 'var(--leading-snug)',
+          <div className="summary-card" style={{ marginBottom: 'var(--space-6)' }}>
+            <h3 className="summary-card-title">{t('search.whyWeThinkThis')}</h3>
+            <p style={{
+              fontSize: 'var(--text-sm)',
+              color: 'var(--text-secondary)',
+              lineHeight: 'var(--leading-normal)',
             }}>
-              {headline}
-            </h2>
-          )}
+              {explanation}
+            </p>
+          </div>
 
-          {/* ── SUMMARY ─────────────────────────────────────────────── */}
-          {summary && (
+          {isUrl && checkedClaims.length > 0 && (
             <div className="summary-card" style={{ marginBottom: 'var(--space-6)' }}>
-              <h3 className="summary-card-title">{t('article.summary')}</h3>
-              <p style={{
-                fontSize: 'var(--text-sm)',
-                color: 'var(--text-secondary)',
-                lineHeight: 'var(--leading-normal)',
-              }}>
-                {typeof summary === 'string'
-                  ? localizeCredibilityText(summary, t)
-                  : localizeCredibilityList(summary, t).join(' ')}
-              </p>
-            </div>
-          )}
-
-          {/* ── KEY FINDINGS ────────────────────────────────────────── */}
-          {Array.isArray(keyFindings) && keyFindings.length > 0 && (
-            <div className="summary-card" style={{ marginBottom: 'var(--space-6)' }}>
-              <h3 className="summary-card-title">{t('search.keyFindings')}</h3>
+              <h3 className="summary-card-title">{t('search.checkedClaims')}</h3>
               <div className="summary-list">
-                {keyFindings.map((finding, i) => (
-                  <div key={i} className="summary-item">{finding}</div>
+                {checkedClaims.map((claim, index) => (
+                  <div key={`${claim.claim}-${index}`} className="summary-item">
+                    <strong>{claim.claim}</strong> {' '}
+                    <span style={{ color: 'var(--text-tertiary)' }}>
+                      ({claim.score}/100)
+                    </span>
+                  </div>
                 ))}
               </div>
             </div>
           )}
 
-          {signals && (
-            <div style={{ marginBottom: 'var(--space-6)' }}>
-              <SourceSignalPanel signals={signals} />
-            </div>
-          )}
-
-          {/* ── TIMELINE ────────────────────────────────────────────── */}
-          {timeline.length > 0 && (
-            <div style={{
-              marginBottom: 'var(--space-6)',
-              background: 'var(--bg-card)',
-              borderRadius: 'var(--radius-xl)',
-              border: '1px solid var(--border-light)',
-              padding: 'var(--space-6)',
+          <div style={{
+            background: 'var(--bg-card)',
+            borderRadius: 'var(--radius-xl)',
+            border: '1px solid var(--border-light)',
+            padding: 'var(--space-6)',
+            marginBottom: 'var(--space-6)',
+          }}>
+            <h3 style={{
+              fontFamily: 'var(--font-serif)',
+              fontSize: 'var(--text-xl)',
+              fontWeight: 700,
+              marginBottom: 'var(--space-4)',
             }}>
-              <h3 style={{
-                fontFamily: 'var(--font-serif)',
-                fontSize: 'var(--text-xl)',
-                fontWeight: 700,
-                marginBottom: 'var(--space-5)',
-              }}>
-                {t('search.timeline')}
-              </h3>
-              {timeline.map((item, i) => (
-                <div key={i} style={{
-                  display: 'flex',
-                  gap: 'var(--space-4)',
-                  padding: 'var(--space-3) 0',
-                  borderLeft: '2px solid var(--accent-primary)',
-                  paddingLeft: 'var(--space-4)',
-                  marginLeft: 'var(--space-2)',
-                  position: 'relative',
-                  marginBottom: i < timeline.length - 1 ? 'var(--space-2)' : 0,
-                }}>
-                  <div style={{
-                    position: 'absolute',
-                    left: '-6px',
-                    top: 'var(--space-3)',
-                    width: '10px',
-                    height: '10px',
-                    borderRadius: '50%',
-                    background: 'var(--accent-primary)',
-                  }} />
-                  <div>
-                    <div style={{ fontSize: 'var(--text-xs)', color: 'var(--accent-primary)', fontWeight: 600 }}>
-                      {item.date}
-                    </div>
-                    <div style={{ fontSize: 'var(--text-sm)', marginTop: 'var(--space-1)' }}>
-                      {item.event}
-                    </div>
-                    <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-1)' }}>
-                      {t('search.timelineSource')}: {item.sourceLabel}
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+              {t('search.sourcesChecked')}
+            </h3>
 
-          {/* ── RECOMMENDATION ──────────────────────────────────────── */}
-          {recommendedNextStep && (
-            <div className="recommendation-panel" style={{ marginBottom: 'var(--space-6)' }}>
-              <h3 className="recommendation-panel-title">
-                {t('article.whatShouldYouDo')}
-              </h3>
-              <div className="recommendation-action">
-                {recommendedNextStep}
+            {evidence.length === 0 ? (
+              <p style={{ color: 'var(--text-secondary)', margin: 0 }}>
+                {t('search.noEvidenceChecked')}
+              </p>
+            ) : (
+              <div style={{ display: 'grid', gap: 'var(--space-3)' }}>
+                {evidence.map((item, index) => {
+                  const tone = item.stance === 'supports'
+                    ? 'credible'
+                    : item.stance === 'contradicts'
+                      ? 'notCredible'
+                      : 'mixed';
+
+                  return (
+                    <a
+                      key={`${item.url}-${index}`}
+                      href={item.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{
+                        display: 'block',
+                        padding: 'var(--space-4)',
+                        borderRadius: 'var(--radius-lg)',
+                        border: '1px solid var(--border-light)',
+                        textDecoration: 'none',
+                        color: 'inherit',
+                        background: 'var(--bg-primary)',
+                      }}
+                    >
+                      <div style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        gap: 'var(--space-3)',
+                        flexWrap: 'wrap',
+                        marginBottom: 'var(--space-2)',
+                      }}>
+                        <strong style={{ color: 'var(--text-primary)' }}>{item.title || item.source}</strong>
+                        <span className={`source-similarity-pill ${tone}`} style={{ alignSelf: 'flex-start' }}>
+                          {t(`search.stanceLabels.${item.stance || 'context'}`)}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-2)' }}>
+                        {item.source}
+                      </div>
+                      <div style={{
+                        fontSize: 'var(--text-sm)',
+                        color: 'var(--text-secondary)',
+                        lineHeight: 'var(--leading-normal)',
+                      }}>
+                        {item.snippet}
+                      </div>
+                    </a>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {limitations.length > 0 && (
+            <div className="summary-card" style={{ marginBottom: 'var(--space-6)' }}>
+              <h3 className="summary-card-title">{t('search.analysisLimitations')}</h3>
+              <div className="summary-list">
+                {limitations.map((item, index) => (
+                  <div key={index} className="summary-item">{item}</div>
+                ))}
               </div>
             </div>
           )}
 
-          {/* ── RELATED RESOURCES ───────────────────────────────────── */}
-          {relatedResources.length > 0 && (
-            <div style={{
-              background: 'var(--bg-card)',
-              borderRadius: 'var(--radius-xl)',
-              border: '1px solid var(--border-light)',
-              padding: 'var(--space-6)',
-              marginBottom: 'var(--space-6)',
-            }}>
-              <h3 style={{
-                fontFamily: 'var(--font-serif)',
-                fontSize: 'var(--text-xl)',
-                fontWeight: 700,
-                marginBottom: 'var(--space-4)',
-              }}>
-                {t('search.relatedResources')}
-              </h3>
-              {relatedResources.map((res, i) => (
-                <div key={i} style={{
-                  padding: 'var(--space-3) var(--space-4)',
-                  background: 'var(--accent-primary-bg)',
-                  borderRadius: 'var(--radius-md)',
-                  marginBottom: 'var(--space-2)',
-                }}>
-                  <div style={{ fontSize: 'var(--text-sm)', fontWeight: 500, color: 'var(--accent-primary)' }}>
-                    {res.label}
-                  </div>
-                  <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-1)' }}>
-                    {res.reason}
-                  </div>
-                </div>
-              ))}
+          <div className="recommendation-panel" style={{ marginBottom: 'var(--space-6)' }}>
+            <h3 className="recommendation-panel-title">{t('article.whatShouldYouDo')}</h3>
+            <div className="recommendation-action">
+              {localizeCredibilityText(result.recommendedNextStep || '', t)}
             </div>
-          )}
+          </div>
 
-          {/* Legacy resources for local engine */}
-          {!isOpenAI && result.recommendation?.resources?.length > 0 && (
-            <div className="recommendation-panel">
-              <h3 className="recommendation-panel-title">{t('article.officialResources')}</h3>
-              {result.recommendation.resources.map((resource, i) => (
-                <a key={i} href={resource.url} target="_blank" rel="noopener noreferrer" className="resource-link">
-                  {resource.name}
-                </a>
-              ))}
-            </div>
-          )}
-
-          {/* ── NEW SEARCH ──────────────────────────────────────────── */}
           <div style={{ textAlign: 'center', marginTop: 'var(--space-8)' }}>
             <Button as={Link} to="/search" className="btn btn-primary btn-large" id="new-search-btn">
               {t('search.checkAnotherClaim')}
