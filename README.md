@@ -1,10 +1,10 @@
-# Sure Boh?
+# Sure Bo?
 
 A multilingual news credibility and misinformation awareness platform that helps users evaluate articles, claims, and online content more critically.
 
 ## Overview
 
-Sure Boh? is designed to help users navigate the growing problem of misinformation online. Instead of acting as a black-box detector that simply labels content as true or false, the platform aims to make credibility checking more understandable, accessible, and educational.
+Sure Bo? is designed to help users navigate the growing problem of misinformation online. Instead of acting as a black-box detector that simply labels content as true or false, the platform aims to make credibility checking more understandable, accessible, and educational.
 
 Users can search for a claim, article, or news topic, view a credibility assessment, translate content into their preferred language, and learn how to identify misleading information for themselves through a built-in fake news guide.
 
@@ -22,7 +22,7 @@ This problem is made worse by two key issues:
 
 ## Our Solution
 
-Sure Boh? addresses both of these issues by combining:
+Sure Bo? addresses both of these issues by combining:
 
 - **AI-assisted credibility analysis**
 - **Multilingual search and translation**
